@@ -1,0 +1,78 @@
+:root{
+  --bg:#0b0f14; --bg2:#121822; --card:#161e2a; --line:#222e3e;
+  --txt:#e8eef6; --muted:#8a99ad; --accent:#36d399; --accent2:#3aa0ff;
+  --warn:#fbbf24; --bad:#f87171; --good:#36d399;
+  --radius:18px;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--txt);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+#app{max-width:520px;margin:0 auto;padding:
+  env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 16px)}
+.topbar{display:flex;justify-content:space-between;align-items:center;
+  padding:18px 2px 12px}
+.hello{font-size:22px;font-weight:700;letter-spacing:.2px}
+.date{color:var(--muted);font-size:13px;margin-top:2px}
+.refresh{background:var(--card);border:1px solid var(--line);color:var(--txt);
+  width:42px;height:42px;border-radius:50%;font-size:20px;cursor:pointer}
+.refresh:active{transform:rotate(90deg)}
+.content{display:flex;flex-direction:column;gap:14px}
+.skeleton{color:var(--muted);text-align:center;padding:60px 0}
+
+.card{background:var(--card);border:1px solid var(--line);
+  border-radius:var(--radius);padding:16px}
+.card h3{margin:0 0 12px;font-size:13px;font-weight:600;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.6px}
+
+/* hero: recovery ring + two stats */
+.hero{display:grid;grid-template-columns:1.1fr 1fr;gap:12px;align-items:center}
+.ring-wrap{position:relative;width:140px;height:140px;margin:0 auto}
+.ring{display:block;width:140px;height:140px}
+.val{position:absolute;top:0;left:0;right:0;height:140px;display:flex;
+  flex-direction:column;align-items:center;justify-content:center;pointer-events:none}
+.num{font-size:34px;font-weight:800;line-height:1}
+.lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-top:4px}
+.heros{display:flex;flex-direction:column;gap:12px}
+.stat{background:var(--bg2);border-radius:14px;padding:12px 14px}
+.stat .k{font-size:12px;color:var(--muted)}
+.stat .v{font-size:24px;font-weight:700;margin-top:2px}
+.stat .v small{font-size:13px;color:var(--muted);font-weight:500}
+
+/* biometric grid */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.metric{background:var(--bg2);border-radius:14px;padding:12px 14px}
+.metric .k{font-size:12px;color:var(--muted)}
+.metric .v{font-size:22px;font-weight:700;margin-top:2px}
+.metric .v small{font-size:12px;color:var(--muted);font-weight:500}
+.spark{margin-top:8px;height:34px;width:100%}
+
+/* macros */
+.macros{display:flex;flex-direction:column;gap:10px}
+.cal{font-size:30px;font-weight:800}
+.cal small{font-size:13px;color:var(--muted);font-weight:500}
+.bar{height:10px;border-radius:6px;background:var(--bg2);overflow:hidden;margin-top:6px}
+.bar > span{display:block;height:100%}
+.mrow{display:flex;justify-content:space-between;font-size:13px;margin-bottom:2px}
+.mrow b{font-weight:700}
+.tag{display:inline-block;font-size:11px;padding:3px 8px;border-radius:20px;
+  background:rgba(54,211,153,.15);color:var(--good);margin-top:4px}
+
+/* pmc */
+.pmc{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;text-align:center}
+.pmc .k{font-size:11px;color:var(--muted);text-transform:uppercase}
+.pmc .v{font-size:22px;font-weight:800;margin-top:2px}
+.chart{margin-top:12px;width:100%;height:90px}
+
+/* hydration */
+.hyd{display:flex;align-items:center;gap:14px}
+.drop{font-size:34px}
+.hyd .big{font-size:26px;font-weight:800}
+.hyd .sub{color:var(--muted);font-size:13px}
+
+/* coach */
+.coach{background:linear-gradient(160deg,#16314a,#161e2a);border-color:#21405c}
+.coach p{margin:0;line-height:1.5;font-size:15px}
+.coach .by{margin-top:10px;font-size:12px;color:var(--muted)}
+
+.foot{text-align:center;color:var(--muted);font-size:11px;padding:18px 0 6px}
+.badge{display:inline-block;padding:2px 8px;bord

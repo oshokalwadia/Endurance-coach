@@ -1,0 +1,76 @@
+"""
+Shared per-day computation used by both the CLI (main.py) and the web API.
+
+build_row() takes one day, fetches WHOOP + TrainingPeaks (or mock), computes
+TDEE / macros / hydration / PMC, generates the coaching brief, and returns a
+flat row dict ready to store or serve. It does NOT write anywhere.
+"""
+import datetime as dt
+
+from config import config
+from clients.trainingpeaks import estimate_tss_from_strain, pmc_update
+from clients import coach
+from utils import calc
+from utils.mock import mock_whoop_day
+
+
+def get_whoop_day(whoop, day):
+    if config.DRY_RUN or whoop is None:
+        return mock_whoop_day(day)
+    return whoop.fetch_day(day)
+
+
+def build_row(day, whoop, tp, prev_ctl, prev_atl):
+    """Return (row_dict, new_ctl, new_atl) for `day`."""
+    a = config.athlete
+    w = get_whoop_day(whoop, day)
+
+    tp_workouts = tp.fetch_workouts(day) if tp else []
+    if tp_workouts:
+        tss = round(sum((x.get("tss") or 0) for x in tp_workouts), 1)
+    else:
+        dur = sum((x.get("duration_min") or 0) for x in w.get("workouts", [])) or None
+        tss = estimate_tss_from_strain(w.get("strain"), dur)
+    pmc = pmc_update(prev_ctl, prev_atl, tss)
+
+    tdee = calc.tdee(a, w.get("calories_burned"))
+    macros = calc.macros(a, tdee, w.get("strain"), w.get("recovery_pct"))
+    hydration = calc.hydration(a, w.get("calories_burned"), w.get("strain"))
+
+    payload = {**w, "tdee": tdee, "tss": tss, **pmc,
+               "macros": macros, "hydration": hydration, "goal": a.goal}
+    recommendation = coach.generate(payload)
+
+    row = {
+        "date": w["date"],
+        "recovery_pct": w.get("recovery_pct"),
+        "hrv_ms": w.get("hrv_ms"),
+        "resting_hr": w.get("resting_hr"),
+        "strain": w.get("strain"),
+        "calories_burned": w.get("calories_burned"),
+        "tdee": tdee,
+        "sleep_hours": w.get("sleep_hours"),
+        "sleep_performance_pct": w.get("sleep_performance_pct"),
+        "sleep_debt_hours": w.get("sleep_debt_hours"),
+        "respiratory_rate": w.get("respiratory_rate"),
+        "tss": tss, "ctl": pmc["ctl"], "atl": pmc["atl"], "tsb": pmc["tsb"],
+        "cal_target": macros["calories"],
+        "protein_g": macros["protein_g"],
+        "carbs_g": macros["carbs_g"],
+        "fat_g": macros["fat_g"],
+        "water_l": hydration["water_l"],
+        "sodium_mg": hydration["sodium_mg"],
+        "recommendation": recommendation,
+    }
+    return row, pmc["ctl"], pmc["atl"]
+
+
+def build_recent(n: int) -> list[dict]:
+    """Compute the last `n` days from scratch (used for DRY_RUN web preview)."""
+    today = dt.date.today()
+    days = [today - dt.timedelta(days=i) for i in range(n - 1, -1, -1)]
+    rows, ctl, atl = [], 0.0, 0.0
+    for d in days:
+        row, ctl, atl = build_row(d, None, None, ctl, atl)
+        rows.append(row)
+    return rows
