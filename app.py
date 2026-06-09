@@ -1,28 +1,180 @@
 """
-Endurance Coach - single-file web app.
-Capabilities activate when their env vars are set (in Render). No keys = demo mode.
-  OPENAI_API_KEY -> daily brief written by OpenAI.   Visit /diag to debug OpenAI.
+Endurance Coach - single-file web app (WHOOP-enabled).
+
+Capabilities activate when their env vars are present (set in Render):
+  OPENAI_API_KEY                 -> daily brief written by OpenAI
+  WHOOP_CLIENT_ID / _SECRET      -> connect WHOOP for REAL data
+  UPSTASH_REDIS_REST_URL / _TOKEN-> remembers your WHOOP login between naps
+With no WHOOP/Upstash set, it serves realistic demo data.
+
+Connect WHOOP by visiting:  /whoop/login   (one tap, one time)
+Debug helpers:  /whoop/status   /diag
 Deploy:  gunicorn app:app --bind 0.0.0.0:$PORT
 """
-import os, json, random, datetime as dt, base64, urllib.request, urllib.error
-from flask import Flask, jsonify, request, Response
+import os, json, time, random, datetime as dt, base64
+import urllib.request, urllib.error, urllib.parse
+from flask import Flask, jsonify, request, Response, redirect
 
 app = Flask(__name__)
 ATHLETE=os.environ.get("ATHLETE_NAME","Osho"); SEX=os.environ.get("SEX","male")
 AGE=int(os.environ.get("AGE","35")); HEIGHT=float(os.environ.get("HEIGHT_CM","180"))
 WEIGHT=float(os.environ.get("WEIGHT_KG","75")); GOAL=os.environ.get("GOAL","performance")
 OPENAI_KEY=os.environ.get("OPENAI_API_KEY",""); OPENAI_MODEL=os.environ.get("OPENAI_MODEL","gpt-4o-mini")
-_brief_cache={}; _last_error=None
 
+WHOOP_ID=os.environ.get("WHOOP_CLIENT_ID",""); WHOOP_SECRET=os.environ.get("WHOOP_CLIENT_SECRET","")
+WHOOP_REDIRECT=os.environ.get("WHOOP_REDIRECT_URI","https://endure-taq2.onrender.com/whoop/callback")
+WHOOP_SCOPES="read:recovery read:cycles read:sleep read:workout offline"
+WHOOP_AUTH="https://api.prod.whoop.com/oauth/oauth2/auth"
+WHOOP_TOKEN="https://api.prod.whoop.com/oauth/oauth2/token"
+WHOOP_API="https://api.prod.whoop.com/developer/v2"
+
+UPSTASH_URL=os.environ.get("UPSTASH_REDIS_REST_URL",""); UPSTASH_TOKEN=os.environ.get("UPSTASH_REDIS_REST_TOKEN","")
+_brief_cache={}; _last_error=None; _mem={}
+
+# ---------------- tiny persistent store (Upstash REST, falls back to memory) ----------------
+def kv_get(key):
+    if not (UPSTASH_URL and UPSTASH_TOKEN): return _mem.get(key)
+    try:
+        req=urllib.request.Request(UPSTASH_URL.rstrip("/"),
+            data=json.dumps(["GET",key]).encode(),
+            headers={"Authorization":f"Bearer {UPSTASH_TOKEN}","Content-Type":"application/json"})
+        with urllib.request.urlopen(req,timeout=15) as r:
+            return json.loads(r.read()).get("result")
+    except Exception:
+        return _mem.get(key)
+def kv_set(key,val):
+    _mem[key]=val
+    if not (UPSTASH_URL and UPSTASH_TOKEN): return
+    try:
+        req=urllib.request.Request(UPSTASH_URL.rstrip("/"),
+            data=json.dumps(["SET",key,val]).encode(),
+            headers={"Authorization":f"Bearer {UPSTASH_TOKEN}","Content-Type":"application/json"})
+        urllib.request.urlopen(req,timeout=15).read()
+    except Exception:
+        pass
+
+# ---------------- WHOOP OAuth + data ----------------
+def whoop_configured(): return bool(WHOOP_ID and WHOOP_SECRET)
+
+def whoop_exchange(code):
+    data=urllib.parse.urlencode({"grant_type":"authorization_code","code":code,
+        "client_id":WHOOP_ID,"client_secret":WHOOP_SECRET,"redirect_uri":WHOOP_REDIRECT}).encode()
+    return _whoop_token_request(data)
+def whoop_refresh(refresh_token):
+    if not refresh_token: return None
+    data=urllib.parse.urlencode({"grant_type":"refresh_token","refresh_token":refresh_token,
+        "client_id":WHOOP_ID,"client_secret":WHOOP_SECRET,"scope":"offline"}).encode()
+    return _whoop_token_request(data)
+def _whoop_token_request(data):
+    global _last_error
+    req=urllib.request.Request(WHOOP_TOKEN,data=data,
+        headers={"Content-Type":"application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req,timeout=25) as r:
+            tok=json.loads(r.read())
+        tok["expires_at"]=time.time()+int(tok.get("expires_in",3600))
+        return tok
+    except urllib.error.HTTPError as e:
+        _last_error=f"token HTTP {e.code}: {e.read().decode()[:300]}"; return None
+    except Exception as e:
+        _last_error=f"token {type(e).__name__}: {e}"; return None
+
+def whoop_access_token():
+    raw=kv_get("whoop:token")
+    if not raw: return None
+    try: blob=json.loads(raw)
+    except Exception: return None
+    if blob.get("expires_at",0) > time.time()+60:
+        return blob.get("access_token")
+    new=whoop_refresh(blob.get("refresh_token"))
+    if not new: return None
+    kv_set("whoop:token",json.dumps(new))
+    return new.get("access_token")
+
+def whoop_connected(): return bool(kv_get("whoop:token"))
+
+def _iso(d): return d.isoformat()+"T00:00:00.000Z"
+def whoop_collection(path, token, start, end, limit=25):
+    global _last_error
+    q=urllib.parse.urlencode({"start":start,"end":end,"limit":limit})
+    req=urllib.request.Request(f"{WHOOP_API}{path}?{q}",headers={"Authorization":f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req,timeout=25) as r:
+            return json.loads(r.read()).get("records",[])
+    except urllib.error.HTTPError as e:
+        _last_error=f"{path} HTTP {e.code}: {e.read().decode()[:200]}"; return []
+    except Exception as e:
+        _last_error=f"{path} {type(e).__name__}: {e}"; return []
+
+def _sleep_hours(stage):
+    keys=("total_light_sleep_time_milli","total_slow_wave_sleep_time_milli","total_rem_sleep_time_milli")
+    vals=[stage.get(k) for k in keys if stage.get(k) is not None]
+    return round(sum(vals)/3600000,1) if vals else None
+def _sleep_debt(score, hrs):
+    need=score.get("sleep_needed") or {}
+    tot=sum(v for v in [need.get("baseline_milli"),need.get("need_from_sleep_debt_milli"),
+        need.get("need_from_recent_strain_milli"),need.get("need_from_recent_nap_milli")] if isinstance(v,(int,float)))
+    if tot and hrs is not None:
+        return round(max(0,tot/3600000-hrs),1)
+    return None
+
+def build_recent_live(n=14):
+    tok=whoop_access_token()
+    if not tok: return None
+    today=dt.date.today(); start_d=today-dt.timedelta(days=n)
+    start=_iso(start_d); end=_iso(today+dt.timedelta(days=1))
+    rec=whoop_collection("/recovery",tok,start,end)
+    cyc=whoop_collection("/cycle",tok,start,end)
+    slp=whoop_collection("/activity/sleep",tok,start,end)
+    wko=whoop_collection("/activity/workout",tok,start,end)
+    by={}
+    for r in rec:
+        d=(r.get("created_at") or "")[:10]
+        if d: by.setdefault(d,{})["rec"]=r.get("score") or {}
+    for c in cyc:
+        d=(c.get("start") or "")[:10]
+        if d: by.setdefault(d,{})["cyc"]=c.get("score") or {}
+    for s in slp:
+        d=(s.get("end") or s.get("start") or "")[:10]
+        if d and not (s.get("nap")): by.setdefault(d,{})["slp"]=s.get("score") or {}
+    for w in wko:
+        d=(w.get("start") or "")[:10]
+        if d: by.setdefault(d,{}).setdefault("wko",[]).append(w.get("score") or {})
+    dates=sorted(by.keys())
+    if not dates: return None
+    rows=[]; ctl=atl=0.0
+    for ds in dates:
+        b=by[ds]; rc=b.get("rec",{}); cy=b.get("cyc",{}); sl=b.get("slp",{})
+        kj=cy.get("kilojoule"); cals=round(kj/4.184) if kj else None
+        strain=cy.get("strain"); dur=None
+        hrs=_sleep_hours(sl.get("stage_summary",{}) if sl else {})
+        tss=tss_from_strain(strain or 0,dur)
+        nc=ctl+(tss-ctl)/42.0; na=atl+(tss-atl)/7.0; tsb=ctl-atl
+        td=tdee(cals); rec_pct=rc.get("recovery_score")
+        m=macros(td,strain or 0,rec_pct); h=hydration(cals,strain or 0)
+        rows.append({"date":ds,"recovery_pct":rec_pct,
+            "hrv_ms":round(rc.get("hrv_rmssd_milli")) if rc.get("hrv_rmssd_milli") else None,
+            "resting_hr":rc.get("resting_heart_rate"),"strain":round(strain,1) if strain else None,
+            "calories_burned":cals,"tdee":td,"sleep_hours":hrs,
+            "sleep_performance_pct":sl.get("sleep_performance_percentage"),
+            "sleep_debt_hours":_sleep_debt(sl,hrs),
+            "respiratory_rate":round(sl.get("respiratory_rate"),1) if sl.get("respiratory_rate") else None,
+            "tss":tss,"ctl":round(nc,1),"atl":round(na,1),"tsb":round(tsb,1),
+            "cal_target":m["calories"],"protein_g":m["protein_g"],"carbs_g":m["carbs_g"],"fat_g":m["fat_g"],
+            "water_l":h["water_l"],"sodium_mg":h["sodium_mg"],
+            "recommendation":coach_template(rec_pct or 0,tsb,m,h,_sleep_debt(sl,hrs) or 0)})
+        ctl,atl=nc,na
+    return rows[-n:]
+
+# ---------------- demo data + sports math ----------------
 def mock_day(day):
     random.seed(day.toordinal())
     strain=round(random.uniform(8,17),1); cals=round(random.uniform(400,1100))
-    return {"date":day.isoformat(),"recovery_pct":random.randint(35,95),
-        "hrv_ms":random.randint(45,110),"resting_hr":random.randint(44,58),
-        "strain":strain,"calories_burned":cals,"sleep_performance_pct":random.randint(60,98),
-        "sleep_hours":round(random.uniform(5.5,8.5),1),"sleep_debt_hours":round(random.uniform(0,2.5),1),
-        "respiratory_rate":round(random.uniform(13,16),1),"duration_min":random.randint(40,110)}
-
+    return {"date":day.isoformat(),"recovery_pct":random.randint(35,95),"hrv_ms":random.randint(45,110),
+        "resting_hr":random.randint(44,58),"strain":strain,"calories_burned":cals,
+        "sleep_performance_pct":random.randint(60,98),"sleep_hours":round(random.uniform(5.5,8.5),1),
+        "sleep_debt_hours":round(random.uniform(0,2.5),1),"respiratory_rate":round(random.uniform(13,16),1),
+        "duration_min":random.randint(40,110)}
 def bmr():
     s=5 if SEX=="male" else -161
     return 10*WEIGHT+6.25*HEIGHT-5*AGE+s
@@ -53,21 +205,18 @@ def coach_template(rec,tsb,m,h,debt):
     form=""
     if tsb<-20: form=" You're carrying heavy fatigue - watch for overreaching."
     elif tsb>10: form=" You're fresh - a good window to race or test."
-    return (f"{load}{form} Fuel ~{m['calories']} kcal: {m['protein_g']}g protein, "
-        f"{m['carbs_g']}g carbs, {m['fat_g']}g fat{' (refuel day)' if m['refuel_day'] else ''}. "
-        f"Hydrate to ~{h['water_l']}L with ~{h['sodium_mg']}mg sodium; {h['note'].lower()}. "
-        f"Protect sleep tonight to clear {debt}h of sleep debt.")
+    return (f"{load}{form} Fuel ~{m['calories']} kcal: {m['protein_g']}g protein, {m['carbs_g']}g carbs, "
+        f"{m['fat_g']}g fat{' (refuel day)' if m['refuel_day'] else ''}. Hydrate to ~{h['water_l']}L with "
+        f"~{h['sodium_mg']}mg sodium; {h['note'].lower()}. Protect sleep tonight to clear {debt}h of sleep debt.")
 def coach_openai(payload):
     global _last_error
-    if not OPENAI_KEY:
-        _last_error="OPENAI_API_KEY not set"; return None
-    day=payload["date"]
+    if not OPENAI_KEY: return None
+    day=payload.get("date","")
     if day in _brief_cache: return _brief_cache[day]
-    system=("You are an elite endurance coach and sports nutritionist. From the athlete's "
-        "WHOOP recovery, HRV, sleep, strain and CTL/ATL/TSB plus computed calorie/macro/"
-        "hydration targets, give a short, direct, actionable daily briefing (max ~120 words): "
-        "how to train today, fuelling emphasis, hydration, one recovery action. Encouraging, "
-        "never alarmist. No headers.")
+    system=("You are an elite endurance coach and sports nutritionist. From the athlete's WHOOP recovery, "
+        "HRV, sleep, strain and CTL/ATL/TSB plus computed calorie/macro/hydration targets, give a short, "
+        "direct, actionable daily briefing (max ~120 words): how to train today, fuelling emphasis, hydration, "
+        "one recovery action. Encouraging, never alarmist. No headers.")
     body=json.dumps({"model":OPENAI_MODEL,"temperature":0.5,
         "messages":[{"role":"system","content":system},{"role":"user","content":json.dumps(payload)}]}).encode()
     req=urllib.request.Request("https://api.openai.com/v1/chat/completions",data=body,
@@ -75,15 +224,12 @@ def coach_openai(payload):
     try:
         with urllib.request.urlopen(req,timeout=25) as r:
             out=json.loads(r.read())
-        text=out["choices"][0]["message"]["content"].strip()
-        _brief_cache[day]=text; _last_error=None; return text
+        text=out["choices"][0]["message"]["content"].strip(); _brief_cache[day]=text; return text
     except urllib.error.HTTPError as e:
-        try: detail=e.read().decode()[:400]
-        except Exception: detail=""
-        _last_error=f"HTTP {e.code}: {detail}"; return None
+        _last_error=f"openai HTTP {e.code}: {e.read().decode()[:300]}"; return None
     except Exception as e:
-        _last_error=f"{type(e).__name__}: {e}"; return None
-def build_recent(n=14):
+        _last_error=f"openai {type(e).__name__}: {e}"; return None
+def build_mock(n=14):
     today=dt.date.today(); days=[today-dt.timedelta(days=i) for i in range(n-1,-1,-1)]
     rows,ctl,atl=[],0.0,0.0
     for d in days:
@@ -95,9 +241,17 @@ def build_recent(n=14):
             "water_l":h["water_l"],"sodium_mg":h["sodium_mg"],
             "recommendation":coach_template(w["recovery_pct"],tsb,m,h,w["sleep_debt_hours"])})
         ctl,atl=nc,na
-    t=rows[-1]; ai=coach_openai({k:v for k,v in t.items() if not k.startswith("_")})
-    if ai: t["recommendation"]=ai
     return rows
+def get_rows(n):
+    if whoop_configured():
+        live=build_recent_live(n)
+        if live:
+            t=live[-1]; ai=coach_openai({k:v for k,v in t.items() if v is not None})
+            if ai: t["recommendation"]=ai
+            return live,"live"
+    rows=build_mock(n); t=rows[-1]; ai=coach_openai(t)
+    if ai: t["recommendation"]=ai
+    return rows,("ai" if OPENAI_KEY else "dry_run")
 
 INDEX_HTML='<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n<title>Endurance Coach</title>\n<meta name="theme-color" content="#0b0f14">\n<link rel="manifest" href="/manifest.webmanifest">\n<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">\n<meta name="apple-mobile-web-app-capable" content="yes">\n<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">\n<meta name="apple-mobile-web-app-title" content="Coach">\n<link rel="stylesheet" href="/styles.css">\n</head>\n<body>\n<div id="app">\n  <header class="topbar">\n    <div>\n      <div class="hello" id="hello">Loading…</div>\n      <div class="date" id="date"></div>\n    </div>\n    <button id="refresh" class="refresh" aria-label="Refresh">⟳</button>\n  </header>\n\n  <main id="content" class="content">\n    <div class="skeleton">Fetching today\'s data…</div>\n  </main>\n\n  <footer class="foot">\n    <span id="mode"></span>\n  </footer>\n</div>\n<script src="/app.js"></script>\n</body>\n</html>\n'
 STYLES_CSS=':root{\n  --bg:#0b0f14; --bg2:#121822; --card:#161e2a; --line:#222e3e;\n  --txt:#e8eef6; --muted:#8a99ad; --accent:#36d399; --accent2:#3aa0ff;\n  --warn:#fbbf24; --bad:#f87171; --good:#36d399;\n  --radius:18px;\n}\n*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}\nhtml,body{margin:0;background:var(--bg);color:var(--txt);\n  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}\n#app{max-width:520px;margin:0 auto;padding:\n  env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 16px)}\n.topbar{display:flex;justify-content:space-between;align-items:center;\n  padding:18px 2px 12px}\n.hello{font-size:22px;font-weight:700;letter-spacing:.2px}\n.date{color:var(--muted);font-size:13px;margin-top:2px}\n.refresh{background:var(--card);border:1px solid var(--line);color:var(--txt);\n  width:42px;height:42px;border-radius:50%;font-size:20px;cursor:pointer}\n.refresh:active{transform:rotate(90deg)}\n.content{display:flex;flex-direction:column;gap:14px}\n.skeleton{color:var(--muted);text-align:center;padding:60px 0}\n\n.card{background:var(--card);border:1px solid var(--line);\n  border-radius:var(--radius);padding:16px}\n.card h3{margin:0 0 12px;font-size:13px;font-weight:600;color:var(--muted);\n  text-transform:uppercase;letter-spacing:.6px}\n\n/* hero: recovery ring + two stats */\n.hero{display:grid;grid-template-columns:1.1fr 1fr;gap:12px;align-items:center}\n.ring-wrap{position:relative;width:140px;height:140px;margin:0 auto}\n.ring{display:block;width:140px;height:140px}\n.val{position:absolute;top:0;left:0;right:0;height:140px;display:flex;\n  flex-direction:column;align-items:center;justify-content:center;pointer-events:none}\n.num{font-size:34px;font-weight:800;line-height:1}\n.lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-top:4px}\n.heros{display:flex;flex-direction:column;gap:12px}\n.stat{background:var(--bg2);border-radius:14px;padding:12px 14px}\n.stat .k{font-size:12px;color:var(--muted)}\n.stat .v{font-size:24px;font-weight:700;margin-top:2px}\n.stat .v small{font-size:13px;color:var(--muted);font-weight:500}\n\n/* biometric grid */\n.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}\n.metric{background:var(--bg2);border-radius:14px;padding:12px 14px}\n.metric .k{font-size:12px;color:var(--muted)}\n.metric .v{font-size:22px;font-weight:700;margin-top:2px}\n.metric .v small{font-size:12px;color:var(--muted);font-weight:500}\n.spark{margin-top:8px;height:34px;width:100%}\n\n/* macros */\n.macros{display:flex;flex-direction:column;gap:10px}\n.cal{font-size:30px;font-weight:800}\n.cal small{font-size:13px;color:var(--muted);font-weight:500}\n.bar{height:10px;border-radius:6px;background:var(--bg2);overflow:hidden;margin-top:6px}\n.bar > span{display:block;height:100%}\n.mrow{display:flex;justify-content:space-between;font-size:13px;margin-bottom:2px}\n.mrow b{font-weight:700}\n.tag{display:inline-block;font-size:11px;padding:3px 8px;border-radius:20px;\n  background:rgba(54,211,153,.15);color:var(--good);margin-top:4px}\n\n/* pmc */\n.pmc{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;text-align:center}\n.pmc .k{font-size:11px;color:var(--muted);text-transform:uppercase}\n.pmc .v{font-size:22px;font-weight:800;margin-top:2px}\n.chart{margin-top:12px;width:100%;height:90px}\n\n/* hydration */\n.hyd{display:flex;align-items:center;gap:14px}\n.drop{font-size:34px}\n.hyd .big{font-size:26px;font-weight:800}\n.hyd .sub{color:var(--muted);font-size:13px}\n\n/* coach */\n.coach{background:linear-gradient(160deg,#16314a,#161e2a);border-color:#21405c}\n.coach p{margin:0;line-height:1.5;font-size:15px}\n.coach .by{margin-top:10px;font-size:12px;color:var(--muted)}\n\n.foot{text-align:center;color:var(--muted);font-size:11px;padding:18px 0 6px}\n.badge{display:inline-block;padding:2px 8px;border-radius:20px;\n  border:1px solid var(--line)}\n'
@@ -125,21 +279,45 @@ def iapple(): return Response(ICON_APPLE,mimetype="image/png")
 
 @app.route("/api/data")
 def data():
-    days=int(request.args.get("days",14))
-    return jsonify({"athlete":ATHLETE,"goal":GOAL,"mode":"ai" if OPENAI_KEY else "dry_run","rows":build_recent(days)})
+    days=int(request.args.get("days",14)); rows,source=get_rows(days)
+    return jsonify({"athlete":ATHLETE,"goal":GOAL,"mode":source,"rows":rows})
+
+@app.route("/whoop/login")
+def whoop_login():
+    if not whoop_configured():
+        return Response("WHOOP not configured. Set WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET in Render.",mimetype="text/plain")
+    state=base64.urlsafe_b64encode(os.urandom(6)).decode()
+    p=urllib.parse.urlencode({"response_type":"code","client_id":WHOOP_ID,
+        "redirect_uri":WHOOP_REDIRECT,"scope":WHOOP_SCOPES,"state":state})
+    return redirect(f"{WHOOP_AUTH}?{p}")
+
+@app.route("/whoop/callback")
+def whoop_callback():
+    err=request.args.get("error")
+    if err: return Response(f"WHOOP returned an error: {err}",mimetype="text/plain")
+    code=request.args.get("code")
+    if not code: return Response("No code from WHOOP.",mimetype="text/plain")
+    tok=whoop_exchange(code)
+    if not tok or not tok.get("access_token"):
+        return Response(f"Could not get WHOOP token. {_last_error or ''}",mimetype="text/plain")
+    kv_set("whoop:token",json.dumps(tok))
+    return redirect("/?connected=1")
+
+@app.route("/whoop/status")
+def whoop_status():
+    return jsonify({"whoop_configured":whoop_configured(),"whoop_connected":whoop_connected(),
+        "upstash_set":bool(UPSTASH_URL and UPSTASH_TOKEN),"openai_set":bool(OPENAI_KEY),
+        "redirect_uri":WHOOP_REDIRECT,"last_error":_last_error})
 
 @app.route("/diag")
 def diag():
-    k=OPENAI_KEY
     _brief_cache.clear()
-    test=coach_openai({"date":"diag","recovery_pct":70,"strain":10,"tdee":2800,"ctl":40,
-        "atl":35,"tsb":5,"hrv_ms":80,"resting_hr":50,"sleep_hours":7,"cal_target":2800,
-        "protein_g":135,"carbs_g":300,"fat_g":90,"water_l":3,"sodium_mg":2500,
-        "sleep_debt_hours":0.5,"sleep_performance_pct":85,"respiratory_rate":14})
-    return jsonify({"key_present":bool(k),"key_length":len(k),
-        "key_prefix":k[:7] if k else "","key_suffix":k[-4:] if k else "",
-        "model":OPENAI_MODEL,"openai_success":bool(test),"error":_last_error,
-        "sample":(test[:160] if test else None)})
+    test=coach_openai({"date":"diag","recovery_pct":70,"strain":10,"tdee":2800,"ctl":40,"atl":35,
+        "tsb":5,"cal_target":2800,"protein_g":135,"carbs_g":300,"fat_g":90,"water_l":3,"sodium_mg":2500,
+        "sleep_debt_hours":0.5,"hrv_ms":80,"resting_hr":50,"sleep_hours":7})
+    return jsonify({"openai_set":bool(OPENAI_KEY),"openai_success":bool(test),
+        "whoop_configured":whoop_configured(),"whoop_connected":whoop_connected(),
+        "upstash_set":bool(UPSTASH_URL and UPSTASH_TOKEN),"error":_last_error})
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT",8000)))
